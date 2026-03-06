@@ -1,4 +1,4 @@
-name: " Refresh mensuel Sitadel 79"
+name: "🔄 Refresh mensuel Sitadel 79"
 
 on:
   # ── Automatique : 1er de chaque mois à 06h00 UTC ────────────
@@ -26,37 +26,40 @@ jobs:
     steps:
 
       # ── 1. Récupérer le code du dépôt ────────────────────────
-      - name: " Checkout du dépôt"
+      - name: "📥 Checkout du dépôt"
         uses: actions/checkout@v4
 
       # ── 2. Installer R ───────────────────────────────────────
-      - name: " Installation de R 4.4"
+      - name: "🔧 Installation de R 4.4"
         uses: r-lib/actions/setup-r@v2
         with:
           r-version: "4.4"
 
-      # ── 3. Dépendances système pour le package sf ────────────
-      - name: " Dépendances système (GDAL pour sf)"
+      # ── 3. Dépendances système pour sf, plotly, leaflet, rmarkdown
+      - name: "🔧 Dépendances système"
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            libgdal-dev libgeos-dev libproj-dev \
+            libgdal-dev libgeos-dev libproj-dev libsqlite3-dev \
             libcurl4-openssl-dev libssl-dev libxml2-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            libharfbuzz-dev libfribidi-dev \
+            libpng-dev libtiff5-dev libjpeg-dev \
             pandoc
 
       # ── 4. Cache des packages R ──────────────────────────────
-      - name: " Cache des packages R"
+      - name: "💾 Cache des packages R"
         uses: actions/cache@v4
         with:
           path: ${{ env.R_LIBS_USER }}
           key: r-pkgs-ubuntu-${{ hashFiles('packages.R') }}
           restore-keys: r-pkgs-ubuntu-
 
-      - name: " Installation des packages R"
+      - name: "📦 Installation des packages R"
         run: Rscript packages.R
 
       # ── 5. Cache des données Sitadel (évite re-téléchargement) ─
-      - name: " Cache des données Sitadel"
+      - name: "💾 Cache des données Sitadel"
         uses: actions/cache@v4
         with:
           path: data_cache/
@@ -66,23 +69,23 @@ jobs:
             sitadel-data-
 
       # ── 6. Télécharger + générer le dashboard ────────────────
-      - name: " Téléchargement Sitadel + génération dashboard"
+      - name: "⬇️ Téléchargement Sitadel + génération dashboard"
         run: Rscript run_refresh.R
         env:
           FORCE_REFRESH: ${{ github.event.inputs.force_refresh || 'false' }}
 
       # ── 7. Vérifier que le HTML existe ───────────────────────
-      - name: " Vérification du fichier HTML"
+      - name: "✅ Vérification du fichier HTML"
         run: |
           if [ ! -f "docs/index.html" ]; then
-            echo " ERREUR : docs/index.html non généré !"
+            echo "❌ ERREUR : docs/index.html non généré !"
             exit 1
           fi
           SIZE=$(du -sh docs/index.html | cut -f1)
-          echo " docs/index.html généré ($SIZE)"
+          echo "✅ docs/index.html généré ($SIZE)"
 
       # ── 8. Pousser le HTML sur GitHub ────────────────────────
-      - name: " Publication sur GitHub Pages"
+      - name: "🚀 Publication sur GitHub Pages"
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
