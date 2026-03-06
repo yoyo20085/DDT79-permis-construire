@@ -1,0 +1,552 @@
+---
+title: "Permis de Construire — Deux-Sèvres (79)"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    theme: flatly
+    self_contained: true
+    navbar:
+      - { title: "Source : SDES / DiDo — Sitadel", align: right }
+      - { title: "Données 2013–2026", align: right }
+---
+
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(plotly)
+library(leaflet)
+library(dplyr)
+library(lubridate)
+library(sf)
+
+# ── Chargement des données ────────────────────────────────────
+CACHE_DIR <- "data_cache"
+
+lgt <- readRDS(file.path(CACHE_DIR, "sitadel_logements_79.rds"))
+loc <- readRDS(file.path(CACHE_DIR, "sitadel_locaux_79.rds"))
+geo <- readRDS(file.path(CACHE_DIR, "communes_79.rds"))
+
+nat_lgt <- tryCatch(
+  readRDS(file.path(CACHE_DIR, "sitadel_nat_lgt_dep.rds")),
+  error = function(e) NULL
+)
+
+# ── Noms de communes (jointure geo) ──────────────────────────
+geo_noms <- as.data.frame(geo) %>%
+  select(code, nom) %>%
+  mutate(code = as.character(code))
+
+# ── Pré-calculs (toutes années, tous types) ──────────────────
+an_max   <- max(lgt$ANNEE, na.rm = TRUE)
+an_min   <- min(lgt$ANNEE, na.rm = TRUE)
+an_ref   <- an_max - 1   # dernière année complète pour comparaison
+
+# KPIs logements (toutes années)
+kpi_tot      <- sum(lgt$NB_LGT_TOT_CREES, na.rm = TRUE)
+kpi_ind      <- sum(lgt$NB_LGT_IND_CREES, na.rm = TRUE)
+kpi_col      <- sum(lgt$NB_LGT_COL_CREES, na.rm = TRUE)
+kpi_chantier <- nrow(lgt %>% filter(ETAT_DAU == 5))
+pct_ind      <- round(100 * kpi_ind / max(kpi_tot, 1))
+pct_col      <- round(100 * kpi_col / max(kpi_tot, 1))
+
+# KPIs locaux
+kpi_surf_tot <- round(sum(loc$SURF_LOC_CREEE, na.rm = TRUE))
+kpi_surf_bur <- round(sum(loc$SURF_BUR_CREEE, na.rm = TRUE))
+kpi_surf_com <- round(sum(loc$SURF_COM_CREEE, na.rm = TRUE))
+kpi_surf_ind <- round(sum(loc$SURF_IND_CREEE, na.rm = TRUE) +
+                      sum(loc$SURF_ENT_CREEE, na.rm = TRUE))
+
+# Évolution trimestrielle logements
+df_trim_lgt <- lgt %>%
+  mutate(TRIM_LABEL = paste0("T", TRIMESTRE, "-", ANNEE)) %>%
+  group_by(TRIM_LABEL, ANNEE, TRIMESTRE) %>%
+  summarise(Individuel = sum(NB_LGT_IND_CREES, na.rm = TRUE),
+            Collectif  = sum(NB_LGT_COL_CREES, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(ANNEE, TRIMESTRE)
+
+# Annuel logements par type permis
+df_annuel_lgt <- lgt %>%
+  group_by(ANNEE, TYPE_DAU) %>%
+  summarise(total = sum(NB_LGT_TOT_CREES, na.rm = TRUE), .groups = "drop") %>%
+  mutate(TYPE_LIBELLE = case_when(
+    TYPE_DAU == "PC" ~ "Permis de Construire",
+    TYPE_DAU == "DP" ~ "Déclaration Préalable",
+    TYPE_DAU == "PA" ~ "Permis d'Aménager",
+    TRUE ~ TYPE_DAU
+  ))
+
+# Top 10 communes logements
+df_top10_lgt <- lgt %>%
+  mutate(COMM = as.character(COMM)) %>%
+  group_by(COMM) %>%
+  summarise(total = sum(NB_LGT_TOT_CREES, na.rm = TRUE), .groups = "drop") %>%
+  left_join(geo_noms, by = c("COMM" = "code")) %>%
+  mutate(label = ifelse(!is.na(nom) & nom != "", nom, COMM)) %>%
+  arrange(desc(total)) %>% head(10)
+
+# Trimestriel locaux
+df_trim_loc <- loc %>%
+  group_by(ANNEE_TRIM) %>%
+  summarise(
+    Bureaux        = sum(SURF_BUR_CREEE, na.rm = TRUE),
+    Commerce       = sum(SURF_COM_CREEE, na.rm = TRUE),
+    Industrie      = sum(SURF_IND_CREEE, na.rm = TRUE),
+    Entrepots      = sum(SURF_ENT_CREEE, na.rm = TRUE),
+    Artisanat      = sum(SURF_ART_CREEE, na.rm = TRUE),
+    Service_public = sum(SURF_PUB_CREEE, na.rm = TRUE),
+    Agriculture    = sum(SURF_AGR_CREEE, na.rm = TRUE),
+    .groups = "drop") %>%
+  arrange(ANNEE_TRIM)
+
+# Annuel locaux
+df_annuel_loc <- loc %>%
+  group_by(ANNEE) %>%
+  summarise(surface = round(sum(SURF_LOC_CREEE, na.rm = TRUE)), .groups = "drop") %>%
+  arrange(ANNEE)
+
+# Top 10 communes locaux
+df_top10_loc <- loc %>%
+  mutate(COMM = as.character(COMM)) %>%
+  group_by(COMM) %>%
+  summarise(surface = round(sum(SURF_LOC_CREEE, na.rm = TRUE)), .groups = "drop") %>%
+  left_join(geo_noms, by = c("COMM" = "code")) %>%
+  mutate(label = ifelse(!is.na(nom) & nom != "", nom, COMM)) %>%
+  arrange(desc(surface)) %>% head(10)
+
+# Carte : logements totaux par commune (toutes années)
+df_carte <- lgt %>%
+  mutate(COMM = as.character(COMM)) %>%
+  group_by(COMM) %>%
+  summarise(valeur = sum(NB_LGT_TOT_CREES, na.rm = TRUE),
+            nb_pc  = n(), .groups = "drop")
+
+geo_carte <- geo
+geo_df    <- as.data.frame(geo) %>% mutate(code = as.character(code)) %>% select(code, nom)
+geo_joined <- geo_df %>%
+  left_join(df_carte, by = c("code" = "COMM")) %>%
+  mutate(valeur = ifelse(is.na(valeur), 0, valeur),
+         nb_pc  = ifelse(is.na(nb_pc),  0, nb_pc))
+geo_carte$valeur <- geo_joined$valeur[match(as.character(geo_carte$code), geo_joined$code)]
+geo_carte$nb_pc  <- geo_joined$nb_pc[ match(as.character(geo_carte$code), geo_joined$code)]
+geo_carte$valeur <- ifelse(is.na(geo_carte$valeur), 0, geo_carte$valeur)
+geo_carte$nb_pc  <- ifelse(is.na(geo_carte$nb_pc),  0, geo_carte$nb_pc)
+
+# Comparaison nationale
+if (!is.null(nat_lgt)) {
+  lgt79_an <- lgt %>%
+    group_by(ANNEE) %>%
+    summarise(lgt_tot = sum(NB_LGT_TOT_CREES, na.rm = TRUE),
+              lgt_ind = sum(NB_LGT_IND_CREES, na.rm = TRUE),
+              lgt_col = sum(NB_LGT_COL_CREES, na.rm = TRUE), .groups = "drop")
+
+  nat_an <- nat_lgt %>%
+    filter(DEP_CODE != "79") %>%
+    group_by(ANNEE) %>%
+    summarise(moy_lgt_tot = mean(lgt_tot, na.rm = TRUE),
+              moy_lgt_ind = mean(lgt_ind, na.rm = TRUE),
+              moy_lgt_col = mean(lgt_col, na.rm = TRUE),
+              nb_deps     = n_distinct(DEP_CODE), .groups = "drop")
+
+  df_comp_evol <- lgt79_an %>% left_join(nat_an, by = "ANNEE") %>% filter(!is.na(ANNEE))
+
+  rangs_dep <- nat_lgt %>%
+    group_by(ANNEE) %>%
+    arrange(ANNEE, desc(lgt_tot)) %>%
+    mutate(rang = row_number(), nb = n()) %>%
+    ungroup() %>%
+    filter(DEP_CODE == "79") %>%
+    select(ANNEE, rang, nb)
+
+  df_distrib <- nat_lgt %>%
+    filter(ANNEE == an_ref) %>%
+    mutate(couleur = if_else(DEP_CODE == "79", "DEP 79", "Autres départements"))
+  val_79_dist  <- df_distrib %>% filter(DEP_CODE == "79") %>% pull(lgt_tot)
+  val_moy_dist <- round(mean(df_distrib$lgt_tot, na.rm = TRUE))
+  vline_79     <- if (length(val_79_dist) > 0) val_79_dist else 0
+
+  v79_ref  <- lgt79_an  %>% filter(ANNEE == an_ref)
+  vnat_ref <- nat_an    %>% filter(ANNEE == an_ref)
+  kpi_79_ref   <- if (nrow(v79_ref)  > 0) v79_ref$lgt_tot  else 0
+  kpi_moy_ref  <- if (nrow(vnat_ref) > 0) round(vnat_ref$moy_lgt_tot) else NA
+  kpi_ecart    <- if (!is.na(kpi_moy_ref) && kpi_moy_ref > 0)
+                    round(100 * (kpi_79_ref - kpi_moy_ref) / kpi_moy_ref, 1) else NA
+  kpi_rang_ref <- nat_lgt %>%
+    filter(ANNEE == an_ref) %>% arrange(desc(lgt_tot)) %>%
+    mutate(rang = row_number()) %>% filter(DEP_CODE == "79") %>% pull(rang)
+  kpi_nb_deps  <- n_distinct(nat_lgt$DEP_CODE)
+
+  has_nat <- TRUE
+} else {
+  has_nat <- FALSE
+}
+```
+
+🏠 Logements
+=====================================
+
+Row
+-------------------------------------
+
+### Total logements autorisés {.value-box}
+```{r}
+valueBox(format(kpi_tot, big.mark=" "),
+         caption = paste0("Logements autorisés (", an_min, "–", an_max, ")"),
+         icon = "fa-home", color = "primary")
+```
+
+### Logements individuels {.value-box}
+```{r}
+valueBox(paste0(format(kpi_ind, big.mark=" "), " (", pct_ind, "%)"),
+         caption = "Individuels", icon = "fa-house-user", color = "success")
+```
+
+### Logements collectifs {.value-box}
+```{r}
+valueBox(paste0(format(kpi_col, big.mark=" "), " (", pct_col, "%)"),
+         caption = "Collectifs", icon = "fa-building", color = "warning")
+```
+
+### Chantiers ouverts {.value-box}
+```{r}
+valueBox(format(kpi_chantier, big.mark=" "),
+         caption = "Chantiers ouverts (ETAT=5)", icon = "fa-hard-hat", color = "info")
+```
+
+Row {data-height=400}
+-------------------------------------
+
+### Évolution trimestrielle des logements autorisés
+```{r}
+plot_ly(df_trim_lgt, x = ~TRIM_LABEL) %>%
+  add_bars(y = ~Individuel, name = "Individuel", marker = list(color = "#2ecc71")) %>%
+  add_bars(y = ~Collectif,  name = "Collectif",  marker = list(color = "#3498db")) %>%
+  layout(barmode = "stack",
+         xaxis = list(title = "", tickangle = -45,
+                      categoryorder = "array",
+                      categoryarray = df_trim_lgt$TRIM_LABEL),
+         yaxis = list(title = "Logements"),
+         legend = list(orientation = "h", y = -0.3),
+         hovermode = "x unified")
+```
+
+### Répartition individuel / collectif
+```{r}
+plot_ly(labels = c("Individuel", "Collectif"),
+        values = c(kpi_ind, kpi_col),
+        type   = "pie",
+        marker = list(colors = c("#2ecc71", "#3498db")),
+        textinfo = "label+percent",
+        textfont = list(size = 14)) %>%
+  layout(showlegend = TRUE, legend = list(orientation = "h"))
+```
+
+Row {data-height=350}
+-------------------------------------
+
+### Logements autorisés par année (type de permis)
+```{r}
+plot_ly(df_annuel_lgt, x = ~ANNEE, y = ~total, color = ~TYPE_LIBELLE,
+        type = "bar",
+        colors = c("Permis de Construire" = "#1f77b4",
+                   "Déclaration Préalable" = "#ff7f0e",
+                   "Permis d'Aménager"    = "#9467bd")) %>%
+  layout(barmode = "group",
+         xaxis = list(title = "Année", dtick = 1),
+         yaxis = list(title = "Logements"),
+         legend = list(orientation = "h", y = -0.3))
+```
+
+### Top 10 communes — Logements autorisés
+```{r}
+plot_ly(df_top10_lgt, x = ~total, y = ~reorder(label, total),
+        type = "bar", orientation = "h",
+        marker = list(color = "#27ae60"),
+        text = ~total, textposition = "outside") %>%
+  layout(xaxis = list(title = "Logements"),
+         yaxis = list(title = ""),
+         margin = list(l = 120))
+```
+
+🏪 Locaux commerciaux
+=====================================
+
+Row
+-------------------------------------
+
+### Surface totale autorisée {.value-box}
+```{r}
+valueBox(paste0(format(kpi_surf_tot, big.mark=" "), " m²"),
+         caption = "Surface locaux autorisée", icon = "fa-warehouse", color = "primary")
+```
+
+### Bureaux {.value-box}
+```{r}
+valueBox(paste0(format(kpi_surf_bur, big.mark=" "), " m²"),
+         caption = "Bureaux", icon = "fa-briefcase", color = "info")
+```
+
+### Commerce {.value-box}
+```{r}
+valueBox(paste0(format(kpi_surf_com, big.mark=" "), " m²"),
+         caption = "Commerce", icon = "fa-shopping-cart", color = "success")
+```
+
+### Industrie + Entrepôts {.value-box}
+```{r}
+valueBox(paste0(format(kpi_surf_ind, big.mark=" "), " m²"),
+         caption = "Industrie + Entrepôts", icon = "fa-industry", color = "warning")
+```
+
+Row {data-height=400}
+-------------------------------------
+
+### Surface de locaux autorisés par trimestre (m²)
+```{r}
+plot_ly(df_trim_loc, x = ~ANNEE_TRIM) %>%
+  add_bars(y = ~Bureaux,        name = "Bureaux",        marker = list(color = "#3498db")) %>%
+  add_bars(y = ~Commerce,       name = "Commerce",       marker = list(color = "#e67e22")) %>%
+  add_bars(y = ~Industrie,      name = "Industrie",      marker = list(color = "#9b59b6")) %>%
+  add_bars(y = ~Entrepots,      name = "Entrepôts",      marker = list(color = "#95a5a6")) %>%
+  add_bars(y = ~Artisanat,      name = "Artisanat",      marker = list(color = "#1abc9c")) %>%
+  add_bars(y = ~Service_public, name = "Service public", marker = list(color = "#e74c3c")) %>%
+  add_bars(y = ~Agriculture,    name = "Agriculture",    marker = list(color = "#27ae60")) %>%
+  layout(barmode = "stack",
+         xaxis = list(title = "", tickangle = -45),
+         yaxis = list(title = "Surface (m²)"),
+         legend = list(orientation = "h", y = -0.3),
+         hovermode = "x unified")
+```
+
+### Répartition par type de local
+```{r}
+plot_ly(
+  labels = c("Bureaux","Commerce","Industrie","Entrepôts",
+             "Artisanat","Service public","Agriculture"),
+  values = c(sum(loc$SURF_BUR_CREEE, na.rm=TRUE),
+             sum(loc$SURF_COM_CREEE, na.rm=TRUE),
+             sum(loc$SURF_IND_CREEE, na.rm=TRUE),
+             sum(loc$SURF_ENT_CREEE, na.rm=TRUE),
+             sum(loc$SURF_ART_CREEE, na.rm=TRUE),
+             sum(loc$SURF_PUB_CREEE, na.rm=TRUE),
+             sum(loc$SURF_AGR_CREEE, na.rm=TRUE)),
+  type = "pie",
+  marker = list(colors = c("#3498db","#e67e22","#9b59b6",
+                            "#95a5a6","#1abc9c","#e74c3c","#27ae60")),
+  textinfo = "label+percent"
+) %>% layout(showlegend = FALSE)
+```
+
+Row {data-height=320}
+-------------------------------------
+
+### Évolution annuelle — Surface locaux (m²)
+```{r}
+plot_ly(df_annuel_loc, x = ~ANNEE, y = ~surface,
+        type = "scatter", mode = "lines+markers",
+        line   = list(color = "#e67e22", width = 2),
+        marker = list(color = "#e67e22", size = 7)) %>%
+  layout(xaxis = list(title = "Année", dtick = 1),
+         yaxis = list(title = "Surface (m²)"))
+```
+
+### Top 10 communes — Surface locaux
+```{r}
+plot_ly(df_top10_loc, x = ~surface, y = ~reorder(label, surface),
+        type = "bar", orientation = "h",
+        marker = list(color = "#e67e22"),
+        text = ~paste0(format(surface, big.mark=" "), " m²"),
+        textposition = "outside") %>%
+  layout(xaxis = list(title = "Surface (m²)"),
+         yaxis = list(title = ""),
+         margin = list(l = 120))
+```
+
+🗺️ Carte
+=====================================
+
+### Carte choroplèthe — Logements autorisés par commune (toutes années)
+```{r}
+pal <- colorNumeric("YlOrRd", domain = geo_carte$valeur, na.color = "#cccccc")
+
+popups <- paste0(
+  "<b>", geo_carte$nom, "</b><br>",
+  "Code INSEE : ", geo_carte$code, "<br>",
+  "<b>Logements autorisés : ", format(geo_carte$valeur, big.mark=" "), "</b><br>",
+  "Nb permis : ", geo_carte$nb_pc, "<br>",
+  "<i>", an_min, "–", an_max, "</i>"
+)
+
+leaflet(geo_carte) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  setView(lng = -0.35, lat = 46.55, zoom = 9) %>%
+  addPolygons(
+    fillColor    = ~pal(valeur),
+    fillOpacity  = 0.75,
+    color        = "white", weight = 1,
+    popup        = popups,
+    label        = ~paste0(nom, " : ", format(valeur, big.mark=" ")),
+    labelOptions = labelOptions(
+      style = list("font-weight"="normal", padding="3px 8px"),
+      textsize = "13px", direction = "auto"),
+    highlightOptions = highlightOptions(
+      weight=3, color="#333", fillOpacity=0.95, bringToFront=TRUE)
+  ) %>%
+  addLegend(pal=pal, values=~valeur,
+            title = paste0("Logements autorisés<br><small>", an_min, "–", an_max, "</small>"),
+            position="bottomright", opacity=0.85)
+```
+
+📊 Comparaison nationale
+=====================================
+
+Row
+-------------------------------------
+
+### DEP 79 — Logements autorisés {.value-box}
+```{r}
+if (has_nat) {
+  valueBox(format(kpi_79_ref, big.mark=" "),
+           caption = paste0("DEP 79 (", an_ref, ")"),
+           icon = "fa-home", color = "primary")
+}
+```
+
+### Moyenne nationale {.value-box}
+```{r}
+if (has_nat) {
+  valueBox(ifelse(is.na(kpi_moy_ref), "N/D", format(kpi_moy_ref, big.mark=" ")),
+           caption = paste0("Moyenne nationale (", an_ref, ")"),
+           icon = "fa-globe", color = "info")
+}
+```
+
+### Rang DEP 79 {.value-box}
+```{r}
+if (has_nat) {
+  rang_val <- if (length(kpi_rang_ref) == 0) NA else kpi_rang_ref
+  couleur  <- if (!is.na(rang_val) && rang_val <= 30) "success"
+              else if (!is.na(rang_val) && rang_val <= 60) "warning"
+              else "danger"
+  valueBox(ifelse(is.na(rang_val), "N/D", paste0(rang_val, " / ", kpi_nb_deps)),
+           caption = "Rang (1 = + de logements)",
+           icon = "fa-trophy", color = couleur)
+}
+```
+
+### Écart vs moyenne {.value-box}
+```{r}
+if (has_nat) {
+  signe <- if (!is.na(kpi_ecart) && kpi_ecart > 0) "+" else ""
+  couleur <- if (!is.na(kpi_ecart) && kpi_ecart > 0) "success" else "danger"
+  valueBox(ifelse(is.na(kpi_ecart), "N/D", paste0(signe, kpi_ecart, "%")),
+           caption = "Écart DEP 79 vs moyenne",
+           icon = "fa-chart-bar", color = couleur)
+}
+```
+
+Row {data-height=380}
+-------------------------------------
+
+### Évolution annuelle — DEP 79 vs moyenne nationale
+```{r}
+if (has_nat) {
+  df_r <- df_comp_evol %>% filter(!is.na(moy_lgt_tot))
+  plot_ly() %>%
+    add_trace(
+      data = df_r,
+      x = ~c(ANNEE, rev(ANNEE)),
+      y = ~c(moy_lgt_tot * 1.3, rev(moy_lgt_tot * 0.7)),
+      type = "scatter", mode = "none", fill = "toself",
+      fillcolor = "rgba(231,76,60,0.12)",
+      name = "±30% moyenne", hoverinfo = "skip"
+    ) %>%
+    add_lines(data = df_comp_evol, x = ~ANNEE, y = ~moy_lgt_tot,
+              name = "Moyenne nationale",
+              line = list(color = "#e74c3c", width = 2, dash = "dash")) %>%
+    add_lines(data = df_comp_evol, x = ~ANNEE, y = ~lgt_tot,
+              name = "DEP 79",
+              line = list(color = "#2980b9", width = 3)) %>%
+    layout(xaxis = list(title = "Année", dtick = 1),
+           yaxis = list(title = "Logements autorisés"),
+           legend = list(orientation = "h", y = -0.25),
+           hovermode = "x unified")
+}
+```
+
+### Rang du DEP 79 parmi les 95 départements
+```{r}
+if (has_nat) {
+  plot_ly(rangs_dep, x = ~ANNEE, y = ~rang,
+          type = "scatter", mode = "lines+markers",
+          line   = list(color = "#8e44ad", width = 2),
+          marker = list(color = "#8e44ad", size = 8),
+          text   = ~paste0("Rang : ", rang, "/", nb),
+          hoverinfo = "x+text") %>%
+    layout(xaxis = list(title = "Année", dtick = 1),
+           yaxis = list(title = "Rang (1 = + de logements)",
+                        autorange = "reversed"),
+           shapes = list(list(
+             type = "line",
+             x0 = min(rangs_dep$ANNEE), x1 = max(rangs_dep$ANNEE),
+             y0 = 47, y1 = 47,
+             line = list(color = "#95a5a6", dash = "dot", width = 1)
+           )))
+}
+```
+
+Row {data-height=320}
+-------------------------------------
+
+### Distribution des 95 départements — Logements autorisés
+```{r}
+if (has_nat) {
+  plot_ly(df_distrib, x = ~lgt_tot, color = ~couleur,
+          colors = c("DEP 79" = "#e74c3c", "Autres départements" = "#bdc3c7"),
+          type = "histogram", nbinsx = 30, opacity = 0.8) %>%
+    layout(
+      barmode = "overlay",
+      xaxis   = list(title = paste0("Logements autorisés (", an_ref, ")")),
+      yaxis   = list(title = "Nb de départements"),
+      legend  = list(orientation = "h", y = -0.25),
+      shapes  = list(
+        list(type="line", x0=vline_79,    x1=vline_79,
+             y0=0, y1=1, yref="paper",
+             line=list(color="#e74c3c", width=2, dash="dash")),
+        list(type="line", x0=val_moy_dist, x1=val_moy_dist,
+             y0=0, y1=1, yref="paper",
+             line=list(color="#2c3e50", width=2, dash="dot"))
+      ),
+      annotations = list(
+        list(x=vline_79,     y=1, yref="paper",
+             text=paste0("DEP 79<br>(", format(vline_79, big.mark=" "), ")"),
+             showarrow=FALSE, font=list(color="#e74c3c", size=11),
+             yanchor="bottom", xanchor="right"),
+        list(x=val_moy_dist, y=1, yref="paper",
+             text=paste0("Moyenne<br>(", format(val_moy_dist, big.mark=" "), ")"),
+             showarrow=FALSE, font=list(color="#2c3e50", size=11),
+             yanchor="bottom", xanchor="left")
+      )
+    )
+}
+```
+
+### DEP 79 vs moyenne — Répartition individuel / collectif
+```{r}
+if (has_nat && nrow(v79_ref) > 0 && nrow(vnat_ref) > 0) {
+  df_type <- data.frame(
+    cat   = c("Individuel", "Collectif"),
+    dep79 = c(round(100 * v79_ref$lgt_ind  / max(v79_ref$lgt_tot,  1)),
+              round(100 * v79_ref$lgt_col  / max(v79_ref$lgt_tot,  1))),
+    nat   = c(round(100 * vnat_ref$moy_lgt_ind / max(vnat_ref$moy_lgt_tot, 1)),
+              round(100 * vnat_ref$moy_lgt_col / max(vnat_ref$moy_lgt_tot, 1)))
+  )
+  plot_ly(df_type, x = ~cat) %>%
+    add_bars(y = ~dep79, name = "DEP 79",        marker = list(color = "#2980b9")) %>%
+    add_bars(y = ~nat,   name = "Moy. nationale", marker = list(color = "#e74c3c")) %>%
+    layout(barmode = "group",
+           xaxis = list(title = ""),
+           yaxis = list(title = "% des logements", range = c(0, 100)),
+           legend = list(orientation = "h", y = -0.25))
+}
+```
